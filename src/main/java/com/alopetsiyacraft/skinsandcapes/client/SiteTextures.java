@@ -52,12 +52,14 @@ import java.util.concurrent.ConcurrentMap;
  * сообщает, тонкая модель или широкая, поэтому size-эвристика (64x128)
  * осталась лишь как запасной вариант для старых ответов без skinModel.
  *
- * Обновление в онлайне: внешность перечитывается с сайта каждые
- * {@value #REFRESH_MS} мс (при этом до конца загрузки показывается
- * старая), а при выходе с сервера кеш очищается — так что скин и плащ
- * меняются без перезапуска игры: достаточно перезайти (мгновенно) или
- * просто подождать до полминуты в онлайне. Сервер для этого не нужен:
- * каждый клиент читает сайт напрямую.
+ * Обновление без фонового поллинга: внешность каждого игрока грузится
+ * один раз за сессию (при заходе на сервер и при появлении нового игрока)
+ * и кешируется до выхода. При выходе с сервера кеш очищается
+ * (ClientPlayerNetworkEvent.LoggingOut), так что перезаход сразу тянет
+ * свежие скин/плащ/модель. Если кто-то поменял внешность на сайте прямо
+ * в онлайне — команда /alopetsiya-refresh перечитает всех сразу, без
+ * перезахода. Постоянных обращений к сайту нет: клиент ходит туда только
+ * по событию (заход, новый игрок, ручная команда, повтор неудачи).
  *
  * Если у игрока на сайте нет ни скина, ни плаща или сайт недоступен —
  * возвращается null (миксин оставляет ванильное поведение: Стив).
@@ -77,8 +79,6 @@ public final class SiteTextures {
     /** Ванильный плащ — 64x32 (UV-развёртка CapeLayer). */
     private static final int CAPE_WIDTH = 64;
     private static final int CAPE_HEIGHT = 32;
-    /** Как часто перечитывать внешность с сайта, пока игрок в онлайне. */
-    private static final long REFRESH_MS = 30_000L;
 
     /** UUID -> готовая внешность с сайта. */
     private final ConcurrentMap<UUID, Entry> entries = new ConcurrentHashMap<>();
@@ -99,8 +99,7 @@ public final class SiteTextures {
         ResourceLocation cape,
         PlayerSkin.Model model,
         String skinUrl,
-        String capeUrl,
-        long loadedAt
+        String capeUrl
     ) {
     }
 
@@ -109,8 +108,8 @@ public final class SiteTextures {
      * Вызывается с render-потока для каждого игрока каждый кадр, поэтому
      * здесь только быстрые чтения кеша; медленная загрузка — в фоновом
      * потоке, готовый результат приходит через {@code Minecraft.execute}.
-     * Когда запись старше {@link #REFRESH_MS} — запускается перечитывание
-     * в фоне, а до его конца отдаётся прежняя внешность.
+     * Загрузка запускается только когда записи ещё нет (первое появление
+     * игрока за сессию) — никакого периодического поллинга.
      */
     public PlayerSkin getSkin(GameProfile profile) {
         UUID id = profile.getId();
@@ -119,12 +118,8 @@ public final class SiteTextures {
 
         Long retry = retryAfter.get(id);
         boolean cooledDown = retry == null || now >= retry;
-        if (cooledDown) {
-            if (entry == null || now - entry.loadedAt() >= REFRESH_MS) {
-                if (loading.add(id)) {
-                    Thread.ofVirtual().start(() -> load(profile));
-                }
-            }
+        if (cooledDown && entry == null && loading.add(id)) {
+            Thread.ofVirtual().start(() -> load(profile));
         }
 
         if (entry != null) {
@@ -144,6 +139,16 @@ public final class SiteTextures {
      * свежую внешность с сайта.
      */
     public void clear() {
+        entries.clear();
+        retryAfter.clear();
+    }
+
+    /**
+     * Ручное обновление прямо в онлайне (команда /alopetsiya-refresh):
+     * сбрасываем кеш, и уже в следующий кадр каждый видимый игрок
+     * перечитается с сайта заново. Вызывается с клиентского потока.
+     */
+    public void refreshAll() {
         entries.clear();
         retryAfter.clear();
     }
@@ -252,7 +257,7 @@ public final class SiteTextures {
                     }
                     entries.put(
                         profile.getId(),
-                        new Entry(finalSkinId, finalCapeId, finalModel, finalSkinUrl, finalCapeUrl, System.currentTimeMillis())
+                        new Entry(finalSkinId, finalCapeId, finalModel, finalSkinUrl, finalCapeUrl)
                     );
                     retryAfter.remove(profile.getId());
                 } catch (Exception e) {
