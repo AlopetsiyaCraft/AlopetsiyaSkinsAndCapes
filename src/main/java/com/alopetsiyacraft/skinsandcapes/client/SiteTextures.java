@@ -52,10 +52,16 @@ import java.util.concurrent.ConcurrentMap;
  * сообщает, тонкая модель или широкая, поэтому size-эвристика (64x128)
  * осталась лишь как запасной вариант для старых ответов без skinModel.
  *
+ * Обновление в онлайне: внешность перечитывается с сайта каждые
+ * {@value #REFRESH_MS} мс (при этом до конца загрузки показывается
+ * старая), а при выходе с сервера кеш очищается — так что скин и плащ
+ * меняются без перезапуска игры: достаточно перезайти (мгновенно) или
+ * просто подождать до полминуты в онлайне. Сервер для этого не нужен:
+ * каждый клиент читает сайт напрямую.
+ *
  * Если у игрока на сайте нет ни скина, ни плаща или сайт недоступен —
  * возвращается null (миксин оставляет ванильное поведение: Стив).
- * Неудачные попытки повторяются не чаще раза в минуту. Внешность
- * кешируется на сессию (перезаход обновит её).
+ * Неудачные попытки повторяются не чаще раза в минуту.
  *
  * Активируется только с клиента: класс подключается из миксина
  * PlayerInfoMixin (секция "client" в alopetsiyaskinsandcapes.mixins.json).
@@ -71,6 +77,8 @@ public final class SiteTextures {
     /** Ванильный плащ — 64x32 (UV-развёртка CapeLayer). */
     private static final int CAPE_WIDTH = 64;
     private static final int CAPE_HEIGHT = 32;
+    /** Как часто перечитывать внешность с сайта, пока игрок в онлайне. */
+    private static final long REFRESH_MS = 30_000L;
 
     /** UUID -> готовая внешность с сайта. */
     private final ConcurrentMap<UUID, Entry> entries = new ConcurrentHashMap<>();
@@ -91,7 +99,8 @@ public final class SiteTextures {
         ResourceLocation cape,
         PlayerSkin.Model model,
         String skinUrl,
-        String capeUrl
+        String capeUrl,
+        long loadedAt
     ) {
     }
 
@@ -100,9 +109,24 @@ public final class SiteTextures {
      * Вызывается с render-потока для каждого игрока каждый кадр, поэтому
      * здесь только быстрые чтения кеша; медленная загрузка — в фоновом
      * потоке, готовый результат приходит через {@code Minecraft.execute}.
+     * Когда запись старше {@link #REFRESH_MS} — запускается перечитывание
+     * в фоне, а до его конца отдаётся прежняя внешность.
      */
     public PlayerSkin getSkin(GameProfile profile) {
-        Entry entry = entries.get(profile.getId());
+        UUID id = profile.getId();
+        Entry entry = entries.get(id);
+        long now = System.currentTimeMillis();
+
+        Long retry = retryAfter.get(id);
+        boolean cooledDown = retry == null || now >= retry;
+        if (cooledDown) {
+            if (entry == null || now - entry.loadedAt() >= REFRESH_MS) {
+                if (loading.add(id)) {
+                    Thread.ofVirtual().start(() -> load(profile));
+                }
+            }
+        }
+
         if (entry != null) {
             ResourceLocation texture = entry.skin() != null
                 ? entry.skin()
@@ -111,19 +135,23 @@ public final class SiteTextures {
             // подписи Mojang у чужих игроков (см. PlayerInfo.createSkinLookup).
             return new PlayerSkin(texture, entry.skinUrl(), entry.cape(), null, entry.model(), true);
         }
-        Long retry = retryAfter.get(profile.getId());
-        if (retry != null && System.currentTimeMillis() < retry) {
-            return null;
-        }
-        if (loading.add(profile.getId())) {
-            Thread.ofVirtual().start(() -> load(profile));
-        }
         return null;
+    }
+
+    /**
+     * Полная очистка кеша — вызывается при выходе с сервера
+     * (ClientPlayerNetworkEvent.LoggingOut), чтобы перезаход сразу тянул
+     * свежую внешность с сайта.
+     */
+    public void clear() {
+        entries.clear();
+        retryAfter.clear();
     }
 
     /**
      * Фоновая загрузка: сайт (skinUrl + capeUrl + skinModel) -> PNG ->
      * NativeImage -> регистрация текстур на render-потоке.
+     * Все ветки обязаны снять флаг {@link #loading}.
      */
     private void load(GameProfile profile) {
         HttpURLConnection lookupConn = null;
@@ -141,7 +169,14 @@ public final class SiteTextures {
             String skinUrl = optString(info, "skinUrl");
             String capeUrl = optString(info, "capeUrl");
             if (skinUrl == null && capeUrl == null) {
-                scheduleRetry(profile.getId()); // на сайте пока нет ни скина, ни плаща
+                // На сайте больше нет ни скина, ни плаща. Если раньше были —
+                // снимаем их (игрок вернётся к ванильному Стиву), иначе просто
+                // ждём: повторим не раньше чем через минуту.
+                Minecraft.getInstance().execute(() -> {
+                    entries.remove(profile.getId());
+                    loading.remove(profile.getId());
+                });
+                scheduleRetry(profile.getId());
                 return;
             }
 
@@ -155,6 +190,7 @@ public final class SiteTextures {
                 BufferedImage skin = ImageIO.read(skinConn.getInputStream());
                 if (skin == null || skin.getWidth() < MIN_SKIN || skin.getHeight() < MIN_SKIN) {
                     scheduleRetry(profile.getId()); // файл скина битый — ждём, заменим
+                    loading.remove(profile.getId());
                     return;
                 }
                 if (model == null) {
@@ -174,6 +210,7 @@ public final class SiteTextures {
                 BufferedImage cape = ImageIO.read(capeConn.getInputStream());
                 if (cape == null) {
                     scheduleRetry(profile.getId()); // файл плаща битый
+                    loading.remove(profile.getId());
                     return;
                 }
                 if (cape.getWidth() != CAPE_WIDTH || cape.getHeight() != CAPE_HEIGHT) {
@@ -186,6 +223,7 @@ public final class SiteTextures {
 
             if (skinId == null && capeId == null) {
                 scheduleRetry(profile.getId());
+                loading.remove(profile.getId());
                 return;
             }
             if (model == null) {
@@ -197,17 +235,25 @@ public final class SiteTextures {
             final DynamicTexture finalSkinTex = skinTex;
             final DynamicTexture finalCapeTex = capeTex;
             final PlayerSkin.Model finalModel = model;
+            final String finalSkinUrl = skinUrl;
+            final String finalCapeUrl = capeUrl;
 
             Minecraft mc = Minecraft.getInstance();
             mc.execute(() -> {
                 try {
+                    // register заменяет и закрывает старую текстуру с тем же
+                    // id (см. TextureManager.register -> safeClose), поэтому
+                    // повторная регистрация при обновлении безопасна.
                     if (finalSkinId != null) {
                         mc.getTextureManager().register(finalSkinId, finalSkinTex);
                     }
                     if (finalCapeId != null) {
                         mc.getTextureManager().register(finalCapeId, finalCapeTex);
                     }
-                    entries.put(profile.getId(), new Entry(finalSkinId, finalCapeId, finalModel, skinUrl, capeUrl));
+                    entries.put(
+                        profile.getId(),
+                        new Entry(finalSkinId, finalCapeId, finalModel, finalSkinUrl, finalCapeUrl, System.currentTimeMillis())
+                    );
                     retryAfter.remove(profile.getId());
                 } catch (Exception e) {
                     scheduleRetry(profile.getId());
@@ -216,7 +262,8 @@ public final class SiteTextures {
                 }
             });
         } catch (Exception e) {
-            // Сайт недоступен / сеть упала — повторим через минуту.
+            // Сайт недоступен / сеть упала — старый результат показываем
+            // дальше (он остаётся в entries), повторим через минуту.
             scheduleRetry(profile.getId());
             loading.remove(profile.getId());
         } finally {
