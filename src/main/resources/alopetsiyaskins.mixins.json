@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.alopetsiyacraft.skins.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "PlayerInfoMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
