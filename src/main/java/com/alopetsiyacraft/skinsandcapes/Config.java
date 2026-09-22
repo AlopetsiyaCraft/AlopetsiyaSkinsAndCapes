@@ -19,7 +19,7 @@ public class Config {
         builder.push("alopetsiyaskinsandcapes");
         websiteUrl = builder
             .comment("URL of the Alopetsiyacraft website (e.g. http://localhost:3000)")
-            .define("websiteUrl", "http://127.0.0.1:3000");
+            .define("websiteUrl", "http://26.80.76.48:3000");
         builder.pop();
     }
 }
