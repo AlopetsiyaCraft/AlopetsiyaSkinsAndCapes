@@ -1,4 +1,4 @@
-package com.alopetsiyacraft.skins;
+package com.alopetsiyacraft.skinsandcapes;
 
 import net.neoforged.neoforge.common.ModConfigSpec;
 import org.apache.commons.lang3.tuple.Pair;
@@ -16,7 +16,7 @@ public class Config {
     public final ModConfigSpec.ConfigValue<String> websiteUrl;
 
     public Config(ModConfigSpec.Builder builder) {
-        builder.push("alopetsiyaskins");
+        builder.push("alopetsiyaskinsandcapes");
         websiteUrl = builder
             .comment("URL of the Alopetsiyacraft website (e.g. http://localhost:3000)")
             .define("websiteUrl", "http://127.0.0.1:3000");
